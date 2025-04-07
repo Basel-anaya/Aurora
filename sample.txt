@@ -1,0 +1,416 @@
+this was my final code btw import numpy as np
+import open3d as o3d
+import matplotlib.pyplot as plt
+import time
+from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Ax2, gp_Vec, gp_Trsf, gp_Ax1, gp_Pnt2d, gp_Circ
+from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakePrism
+from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeWire, BRepBuilderAPI_MakeFace, BRepBuilderAPI_Transform, BRepBuilderAPI_MakeEdge
+from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Fuse
+from OCC.Core.TopoDS import TopoDS_Wire
+from OCC.Core.GCE2d import GCE2d_MakeCircle
+from OCC.Core.gp import gp_Circ2d, gp_Ax2d
+from OCC.Display.SimpleGui import init_display
+from OCC.Core.GeomAPI import GeomAPI_PointsToBSpline
+import copy
+# ================== ARTICULATED COLUMN MODEL ===================
+class ArticulatedSegment:
+    def __init__(self, length, size, parent=None, cross_section='circular'):
+        self.length = length
+        self.size = size #radius for circular or a tuple (width, height) for rectangular
+        self.cross_section = cross_section
+        self.parent = parent
+        self.children = []
+        self.local_rotation = np.zeros(3)  # x, y, z angles in radians, Local rotation relative to parent
+        
+        # World space properties
+        self.start_pos = np.array([0., 0., 0.])
+        self.end_pos = np.array([0., 0., self.length])
+        self.orientation = np.eye(3)  # 3x3 rotation matrix
+        
+        if parent:
+            parent.children.append(self)
+            self.start_pos = parent.end_pos.copy()
+            self.end_pos = self.start_pos + np.array([0., 0., self.length])
+            self.orientation = parent.orientation.copy() #rotations are later applied
+
+    def update_transform(self):
+        """Update segment's transform based on local rotation"""
+        # Create rotation matrices for each axis
+        Rx = np.array([[1, 0, 0], [0, np.cos(self.local_rotation[0]), -np.sin(self.local_rotation[0])],  [0, np.sin(self.local_rotation[0]), np.cos(self.local_rotation[0])]])
+        Ry = np.array([[np.cos(self.local_rotation[1]), 0, np.sin(self.local_rotation[1])], [0, 1, 0], [-np.sin(self.local_rotation[1]), 0, np.cos(self.local_rotation[1])]])
+        Rz = np.array([[np.cos(self.local_rotation[2]), -np.sin(self.local_rotation[2]), 0], [np.sin(self.local_rotation[2]), np.cos(self.local_rotation[2]), 0], [0, 0, 1]])
+        
+        # Combine rotations and update orientation
+        local_orientation = Rz @ Ry @ Rx
+        self.orientation = self.parent.orientation @ local_orientation if self.parent else local_orientation
+        
+        # Update positions
+        if self.parent:
+            self.start_pos = self.parent.end_pos.copy()
+        
+        # Calculate new end position
+        self.end_pos = self.start_pos + self.orientation @ np.array([0., 0., self.length])
+        
+        # Update all children
+        for child in self.children:
+            child.update_transform()
+    
+    def rotate(self, axis, angle):
+        """Rotate segment around specified axis"""
+        if axis in ['x', 'y', 'z']:
+            axis_idx = {'x': 0, 'y': 1, 'z': 2}[axis]
+            self.local_rotation[axis_idx] = angle
+            self.update_transform()
+
+    def create_circular_base(self):
+        """Create a circular base for the prism using direct 3D methods"""
+        radius = self.size if isinstance(self.size, (int, float)) else self.size[0]
+        circle = gp_Circ(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), radius)   # Create a 3D circle directly
+        edge = BRepBuilderAPI_MakeEdge(circle).Edge() # Create an edge from the circle
+        wire = BRepBuilderAPI_MakeWire(edge).Wire() # Create a wire and face
+        face = BRepBuilderAPI_MakeFace(wire).Face()
+        return face
+    
+    def create_rectangular_base(self):
+        width, height = self.size if isinstance(self.size, tuple) else (self.size, self.size)
+        wire_builder = BRepBuilderAPI_MakeWire() # Create a wire in the shape of a rectangle
+        # Define the four corners of the rectangle
+        points = [gp_Pnt(-width/2, -height/2, 0), gp_Pnt(width/2, -height/2, 0), gp_Pnt(width/2, height/2, 0), gp_Pnt(-width/2, height/2, 0)]
+        # Create edges for the wire
+        edge1 = BRepBuilderAPI_MakeEdge(points[0], points[1]).Edge()
+        edge2 = BRepBuilderAPI_MakeEdge(points[1], points[2]).Edge()
+        edge3 = BRepBuilderAPI_MakeEdge(points[2], points[3]).Edge()
+        edge4 = BRepBuilderAPI_MakeEdge(points[3], points[0]).Edge()
+        wire_builder.Add(edge1)
+        wire_builder.Add(edge2)
+        wire_builder.Add(edge3)
+        wire_builder.Add(edge4)
+        wire = wire_builder.Wire()
+        face = BRepBuilderAPI_MakeFace(wire).Face()
+        return face
+    
+    def create_h_shaped_base(self):
+        # Get dimensions from the size parameter
+        # If size is a tuple, use it as (flange_width, web_height, web_thickness, flange_thickness)
+        # If size is a single value, use it to create a proportional H-shape
+        if isinstance(self.size, tuple) and len(self.size) >= 4:
+            flange_width = self.size[0]
+            web_height = self.size[1]
+            web_thickness = self.size[2]
+            flange_thickness = self.size[3]
+        else:
+            # Create proportional H-shape based on a single size value
+            base_size = self.size if isinstance(self.size, (int, float)) else self.size[0]
+            flange_width = base_size
+            web_height = base_size * 1.8  # Make height 80% larger than width
+            web_thickness = base_size * 0.2  # Web thickness is 20% of size
+            flange_thickness = base_size * 0.25  # Flange thickness is 25% of size
+        
+        # Create wire builder
+        wire_builder = BRepBuilderAPI_MakeWire()
+        
+        # Define the 12 corners of the H-section
+        # Starting at top-left corner, going clockwise
+        half_height = web_height / 2
+        half_width = flange_width / 2
+        half_web = web_thickness / 2
+        
+        points = [
+            # Start from bottom left outer and move clockwise
+            gp_Pnt(-half_width, -half_height, 0),
+            gp_Pnt(half_width, -half_height, 0),
+            gp_Pnt(half_width, -half_height + flange_thickness, 0),
+            gp_Pnt(half_web, -half_height + flange_thickness, 0),
+            gp_Pnt(half_web, half_height - flange_thickness, 0),
+            gp_Pnt(half_width, half_height - flange_thickness, 0),
+            gp_Pnt(half_width, half_height, 0),
+            gp_Pnt(-half_width, half_height, 0),
+            gp_Pnt(-half_width, half_height - flange_thickness, 0),
+            gp_Pnt(-half_web, half_height - flange_thickness, 0),
+            gp_Pnt(-half_web, -half_height + flange_thickness, 0),
+            gp_Pnt(-half_width, -half_height + flange_thickness, 0),
+        ]
+
+        
+        # Create edges for the wire by connecting adjacent points
+        for i in range(len(points) - 1):
+            edge = BRepBuilderAPI_MakeEdge(points[i], points[i + 1]).Edge()
+            wire_builder.Add(edge)
+        
+        # Connect last point to the first point to close the shape
+        edge = BRepBuilderAPI_MakeEdge(points[-1], points[0]).Edge()
+        wire_builder.Add(edge)
+        
+        # Create wire and face
+        wire = wire_builder.Wire()
+        face = BRepBuilderAPI_MakeFace(wire).Face()
+        return face
+    
+    def create_geometry(self):
+        """Create visualization geometry using BRepPrimAPI_MakePrism"""
+        # Create the base face based on the cross-section type
+        if self.cross_section.lower() == 'circular':
+            base_face = self.create_circular_base()
+        elif self.cross_section.lower() == 'rectangular':
+            base_face = self.create_rectangular_base()
+        elif self.cross_section.lower() == 'h':
+            base_face = self.create_h_shaped_base()
+        else:
+            # Default to circular if unknown type
+            base_face = self.create_circular_base()
+            
+        # Calculate direction vector from start to end
+        direction = self.end_pos - self.start_pos
+        direction_norm = np.linalg.norm(direction)
+        
+        if direction_norm < 1e-10:
+            # Handle degenerate case
+            dir_vec = gp_Vec(0, 0, self.length)
+        else:
+            direction = direction / direction_norm
+            dir_vec = gp_Vec(direction[0], direction[1], direction[2]) * self.length
+        
+        # Create a transformation to position the base at the start point and orient it properly
+        transform = gp_Trsf()
+        
+        # Calculate rotation from Z-axis to the segment direction
+        z_axis = np.array([0, 0, 1])
+        segment_axis = direction
+        
+        if np.allclose(z_axis, segment_axis, atol=1e-6):
+            # No rotation needed
+            rotation_axis = np.array([1, 0, 0])
+            angle = 0
+        elif np.allclose(z_axis, -segment_axis, atol=1e-6):
+            # 180 degree rotation around X
+            rotation_axis = np.array([1, 0, 0])
+            angle = np.pi
+        else:
+            # Cross product gives rotation axis
+            rotation_axis = np.cross(z_axis, segment_axis)
+            rotation_axis_norm = np.linalg.norm(rotation_axis)
+            
+            # Check if rotation axis is valid (not zero length and no NaN values)
+            if rotation_axis_norm < 1e-10 or np.isnan(rotation_axis_norm) or np.isinf(rotation_axis_norm):
+                # Fall back to a default rotation axis
+                rotation_axis = np.array([1, 0, 0])
+                angle = 0
+            else:
+                rotation_axis = rotation_axis / rotation_axis_norm
+                
+                # Check for NaN or infinite values
+                if np.any(np.isnan(rotation_axis)) or np.any(np.isinf(rotation_axis)):
+                    rotation_axis = np.array([1, 0, 0])
+                    angle = 0
+                
+                # Dot product gives cosine of angle
+                cos_angle = np.dot(z_axis, segment_axis)
+                angle = np.arccos(np.clip(cos_angle, -1.0, 1.0))
+        
+        # Set rotation - explicitly use the components rather than unpacking
+        # Make sure rotation_axis components are valid numbers
+        try:
+            rotation_ax1 = gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(float(rotation_axis[0]), float(rotation_axis[1]), float(rotation_axis[2])))
+            transform.SetRotation(rotation_ax1, angle)
+        except (TypeError, ValueError) as e:
+            print(f"Warning: Error setting rotation: {e}")
+            print(f"Rotation axis: {rotation_axis}, Angle: {angle}")
+            # Use identity rotation as fallback
+            transform.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(1, 0, 0)), 0)
+        
+        # Set translation to the start position
+        try:
+            transform.SetTranslationPart(gp_Vec(*self.start_pos))
+        except (TypeError, ValueError) as e:
+            print(f"Warning: Error setting translation: {e}")
+            print(f"Start position: {self.start_pos}")
+            # Use origin as fallback
+            transform.SetTranslationPart(gp_Vec(0, 0, 0))
+        
+        # Apply transformation to the base face
+        base_face_transformed = BRepBuilderAPI_Transform(base_face, transform).Shape()
+        # Create the prism by sweeping along the direction vector
+        prism = BRepPrimAPI_MakePrism(base_face_transformed, dir_vec).Shape()
+        return prism
+    
+
+class ArticulatedColumn:
+    def __init__(self, num_segments=5, segment_length=1.0, size=0.1, cross_section='circular'):
+        self.segments = []
+        
+        # Create base segment
+        base = ArticulatedSegment(segment_length, size, cross_section=cross_section)
+        self.segments.append(base)
+        
+        # Create chain of segments
+        for i in range(1, num_segments):
+            self.segments.append(ArticulatedSegment(segment_length, size, parent=self.segments[-1], cross_section=cross_section))
+    
+    def bend_at_segment(self, segment_idx, axis, angle):
+        """Bend the column at a specific segment"""
+        if 0 <= segment_idx < len(self.segments):
+            # Rotate the specified segment
+            self.segments[segment_idx].rotate(axis, angle)
+            
+            # Calculate reduced angles for adjacent segments for natural bending
+            reduced_angle = angle * 0.5  # Adjacent segments rotate by half
+            
+            # Rotate adjacent segments in the same direction
+            if segment_idx > 0:
+                self.segments[segment_idx - 1].rotate(axis, reduced_angle)
+            
+            if segment_idx < len(self.segments) - 1:
+                self.segments[segment_idx + 1].rotate(axis, reduced_angle)
+
+# ================== HELPER FUNCTIONS ===================
+def column_to_point_cloud(column, total_points=1000):
+    all_points = []
+    points_per_segment = total_points // len(column.segments)
+    
+    np.random.seed(42) # Set a seed for reproducibility
+    
+    for segment in column.segments:
+        if segment.cross_section.lower() == 'circular':
+            # Use deterministic sampling for circular cross-section
+            radius = segment.size if isinstance(segment.size, (int, float)) else segment.size[0]
+            theta_count = int(np.sqrt(points_per_segment))
+            z_count = points_per_segment // theta_count
+            # Create evenly spaced grid with small random perturbations
+            theta_values = np.linspace(0, 2*np.pi, theta_count, endpoint=False)
+            z_values = np.linspace(0, segment.length, z_count)
+            # Create grid of points
+            theta_grid, z_grid = np.meshgrid(theta_values, z_values)
+            theta = theta_grid.flatten() + np.random.normal(0, 0.05, theta_grid.size)  # Small randomness
+            z = z_grid.flatten() + np.random.normal(0, 0.01, z_grid.size)  # Small randomness
+            # Convert to cartesian coordinates
+            local_points = np.column_stack([radius * np.cos(theta), radius * np.sin(theta), z])
+        
+        elif segment.cross_section.lower() == 'rectangular':
+            width, height = segment.size if isinstance(segment.size, tuple) else (segment.size, segment.size)
+            # Sample points on the six faces of the box
+            sides_count = 6
+            points_per_side = points_per_segment // sides_count
+            local_points = []
+            
+            # Bottom face (z=0)
+            for _ in range(points_per_side):
+                x = np.random.uniform(-width/2, width/2)
+                y = np.random.uniform(-height/2, height/2)
+                local_points.append([x, y, 0])
+            
+            # Top face (z=length)
+            for _ in range(points_per_side):
+                x = np.random.uniform(-width/2, width/2)
+                y = np.random.uniform(-height/2, height/2)
+                local_points.append([x, y, segment.length])
+            
+            # Front face (y=-height/2)
+            for _ in range(points_per_side):
+                x = np.random.uniform(-width/2, width/2)
+                z = np.random.uniform(0, segment.length)
+                local_points.append([x, -height/2, z])
+            
+            # Back face (y=height/2)
+            for _ in range(points_per_side):
+                x = np.random.uniform(-width/2, width/2)
+                z = np.random.uniform(0, segment.length)
+                local_points.append([x, height/2, z])
+            
+            # Left face (x=-width/2)
+            for _ in range(points_per_side):
+                y = np.random.uniform(-height/2, height/2)
+                z = np.random.uniform(0, segment.length)
+                local_points.append([-width/2, y, z])
+            
+            # Right face (x=width/2)
+            for _ in range(points_per_side):
+                y = np.random.uniform(-height/2, height/2)
+                z = np.random.uniform(0, segment.length)
+                local_points.append([width/2, y, z])
+                
+            local_points = np.array(local_points)
+        
+        elif segment.cross_section.lower() == 'h':
+            # For H-section, extract dimensions
+            if isinstance(segment.size, tuple) and len(segment.size) >= 4:
+                flange_width = segment.size[0]
+                web_height = segment.size[1]
+                web_thickness = segment.size[2]
+                flange_thickness = segment.size[3]
+            else:
+                # Create proportional H-shape based on a single size value
+                base_size = segment.size if isinstance(segment.size, (int, float)) else segment.size[0]
+                flange_width = base_size
+                web_height = base_size * 1.8
+                web_thickness = base_size * 0.2
+                flange_thickness = base_size * 0.25
+            
+            half_height = web_height / 2
+            half_width = flange_width / 2
+            half_web = web_thickness / 2
+            
+            # Calculate points per sub-surface to distribute proportionally
+            total_area = 2 * flange_width * flange_thickness + (web_height - 2 * flange_thickness) * web_thickness
+            
+            # Points for the top flange
+            top_flange_points = []
+            points_top_flange = int(points_per_segment * (flange_width * flange_thickness / total_area))
+            for _ in range(points_top_flange):
+                x = np.random.uniform(-half_width, half_width)
+                y = np.random.uniform(half_height - flange_thickness, half_height)
+                z = np.random.uniform(0, segment.length)
+                top_flange_points.append([x, y, z])
+            
+            # Points for the bottom flange
+            bottom_flange_points = []
+            points_bottom_flange = int(points_per_segment * (flange_width * flange_thickness / total_area))
+            for _ in range(points_bottom_flange):
+                x = np.random.uniform(-half_width, half_width)
+                y = np.random.uniform(-half_height, -half_height + flange_thickness)
+                z = np.random.uniform(0, segment.length)
+                bottom_flange_points.append([x, y, z])
+            
+            # Points for the web
+            web_points = []
+            points_web = points_per_segment - points_top_flange - points_bottom_flange
+            for _ in range(points_web):
+                x = np.random.uniform(-half_web, half_web)
+                y = np.random.uniform(-half_height + flange_thickness, half_height - flange_thickness)
+                z = np.random.uniform(0, segment.length)
+                web_points.append([x, y, z])
+            
+            # Combine all points
+            local_points = np.array(top_flange_points + bottom_flange_points + web_points)
+        
+        else:
+            # Default to circular if unknown cross-section
+            radius = 0.1  # Default radius
+            theta_count = int(np.sqrt(points_per_segment))
+            z_count = points_per_segment // theta_count
+            theta_values = np.linspace(0, 2*np.pi, theta_count, endpoint=False)
+            z_values = np.linspace(0, segment.length, z_count)
+            theta_grid, z_grid = np.meshgrid(theta_values, z_values)
+            theta = theta_grid.flatten() + np.random.normal(0, 0.05, theta_grid.size)
+            z = z_grid.flatten() + np.random.normal(0, 0.01, z_grid.size)
+            local_points = np.column_stack([radius * np.cos(theta), radius * np.sin(theta), z])
+        
+        # Transform to world space
+        transformed_points = local_points @ segment.orientation.T + segment.start_pos
+        all_points.append(transformed_points)
+    
+    # Create Open3D point cloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(np.vstack(all_points))
+    
+    return pcd
+
+#calculate the RMSE
+
+def calculate_rmse(source_points, target_points):
+    differences = source_points - target_points
+    squared_diffs = np.square(differences)
+    mean_squared_diff = np.mean(squared_diffs)
+    rmse = np.sqrt(mean_squared_diff)
+    return rmse
+
+# ===
