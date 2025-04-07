@@ -1,7 +1,9 @@
-this was my final code btw import numpy as np
+import numpy as np
 import open3d as o3d
 import matplotlib.pyplot as plt
 import time
+
+# OCC imports
 from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Ax2, gp_Vec, gp_Trsf, gp_Ax1, gp_Pnt2d, gp_Circ
 from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakePrism
 from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeWire, BRepBuilderAPI_MakeFace, BRepBuilderAPI_Transform, BRepBuilderAPI_MakeEdge
@@ -12,6 +14,64 @@ from OCC.Core.gp import gp_Circ2d, gp_Ax2d
 from OCC.Display.SimpleGui import init_display
 from OCC.Core.GeomAPI import GeomAPI_PointsToBSpline
 import copy
+
+# ================== CONSTANTS AND PARAMETERS ===================
+# General parameters
+RANDOM_SEED = 42                   # Seed for reproducibility
+DEFAULT_ERROR_THRESHOLD = 0.001    # Default error threshold for optimization termination
+DEFAULT_MAX_ITERATIONS = 100       # Default maximum number of iterations for optimization
+
+# Point cloud parameters
+DEFAULT_POINTS_PER_CLOUD = 1000    # Default number of points to generate for point clouds
+MIN_POINTS_FOR_CORRESPONDENCE = 10 # Minimum number of points needed for correspondence
+
+# Normals estimation parameters
+NORMALS_RADIUS = 0.15              # Radius for normal estimation
+NORMALS_MAX_NN = 50                # Maximum nearest neighbors for normal estimation
+
+# ICP parameters
+ICP_MAX_CORRESPONDENCE_DISTANCE = 0.2  # Default max correspondence distance for ICP
+ICP_RELATIVE_FITNESS = 1e-6            # Convergence criteria - relative fitness
+ICP_RELATIVE_RMSE = 1e-6               # Convergence criteria - relative RMSE
+ICP_MAX_ITERATION = 50                 # Maximum iterations for ICP
+
+# Optimization parameters
+INITIAL_DIST_THRESHOLD = 0.3       # Initial distance threshold for correspondence matching
+POINT_WEIGHT_MIN = 0.3             # Minimum weight for points 
+POINT_WEIGHT_SCALE = 0.7           # Scale factor for point weights
+SEGMENT_WEIGHT_MIN = 0.2           # Minimum weight for segments
+SEGMENT_WEIGHT_SCALE = 0.8         # Scale factor for segment weights
+DELTA_THETA_SCALE = 0.4            # Scale factor for joint angle updates
+
+# First iteration specific parameters
+FIRST_ITER_CLOSEST_PERCENTAGE = 0.05   # Percentage of closest points to use in first iteration
+FIRST_ITER_DAMPING = 1.0               # Damping factor for first iteration
+FIRST_ITER_CONSTRAINT_WEIGHT = 0.1     # Constraint weight for first iteration
+FIRST_ITER_CONTINUITY_WEIGHT = 0.2     # Continuity weight for first iteration
+FIRST_ITER_MAX_ANGLE_MAIN = np.pi/15   # Maximum angle (main axis) for first iteration
+FIRST_ITER_MAX_ANGLE_OTHER = np.pi/20  # Maximum angle (other axes) for first iteration
+
+# Later iterations parameters
+LATER_ITER_CONSTRAINT_WEIGHT = 0.02    # Constraint weight for later iterations
+LATER_ITER_CONTINUITY_WEIGHT = 0.05    # Continuity weight for later iterations
+LATER_ITER_MAX_ANGLE_MAIN = np.pi/6    # Base maximum angle (main axis) for later iterations
+LATER_ITER_MAX_ANGLE_OTHER = np.pi/12  # Base maximum angle (other axes) for later iterations
+
+# Numerical stability parameters
+EPSILON = 1e-6                     # Small value to prevent division by zero
+MIN_DIRECTION_NORM = 1e-10         # Minimum norm for direction vectors
+
+# H-section proportions (when using single size value)
+H_HEIGHT_RATIO = 1.8               # Web height as multiple of base size
+H_WEB_THICKNESS_RATIO = 0.2        # Web thickness as fraction of base size
+H_FLANGE_THICKNESS_RATIO = 0.25    # Flange thickness as fraction of base size
+
+# Visualization parameters
+ORIGINAL_COLOR = [0.7, 0.7, 0.7]   # Color for original column (gray)
+DEFORMED_COLOR = [0, 0, 1]         # Color for deformed column (blue)
+CURRENT_COLOR = [1, 0, 0]          # Color for current optimization state (red)
+FINAL_COLOR = [0, 1, 0]            # Color for final result (green)
+
 # ================== ARTICULATED COLUMN MODEL ===================
 class ArticulatedSegment:
     def __init__(self, length, size, parent=None, cross_section='circular'):
@@ -163,7 +223,7 @@ class ArticulatedSegment:
         direction = self.end_pos - self.start_pos
         direction_norm = np.linalg.norm(direction)
         
-        if direction_norm < 1e-10:
+        if direction_norm < MIN_DIRECTION_NORM:
             # Handle degenerate case
             dir_vec = gp_Vec(0, 0, self.length)
         else:
@@ -177,11 +237,11 @@ class ArticulatedSegment:
         z_axis = np.array([0, 0, 1])
         segment_axis = direction
         
-        if np.allclose(z_axis, segment_axis, atol=1e-6):
+        if np.allclose(z_axis, segment_axis, atol=EPSILON):
             # No rotation needed
             rotation_axis = np.array([1, 0, 0])
             angle = 0
-        elif np.allclose(z_axis, -segment_axis, atol=1e-6):
+        elif np.allclose(z_axis, -segment_axis, atol=EPSILON):
             # 180 degree rotation around X
             rotation_axis = np.array([1, 0, 0])
             angle = np.pi
@@ -191,7 +251,7 @@ class ArticulatedSegment:
             rotation_axis_norm = np.linalg.norm(rotation_axis)
             
             # Check if rotation axis is valid (not zero length and no NaN values)
-            if rotation_axis_norm < 1e-10 or np.isnan(rotation_axis_norm) or np.isinf(rotation_axis_norm):
+            if rotation_axis_norm < MIN_DIRECTION_NORM or np.isnan(rotation_axis_norm) or np.isinf(rotation_axis_norm):
                 # Fall back to a default rotation axis
                 rotation_axis = np.array([1, 0, 0])
                 angle = 0
@@ -263,11 +323,11 @@ class ArticulatedColumn:
                 self.segments[segment_idx + 1].rotate(axis, reduced_angle)
 
 # ================== HELPER FUNCTIONS ===================
-def column_to_point_cloud(column, total_points=1000):
+def column_to_point_cloud(column, total_points=DEFAULT_POINTS_PER_CLOUD):
     all_points = []
     points_per_segment = total_points // len(column.segments)
     
-    np.random.seed(42) # Set a seed for reproducibility
+    np.random.seed(RANDOM_SEED) # Set a seed for reproducibility
     
     for segment in column.segments:
         if segment.cross_section.lower() == 'circular':
@@ -341,9 +401,9 @@ def column_to_point_cloud(column, total_points=1000):
                 # Create proportional H-shape based on a single size value
                 base_size = segment.size if isinstance(segment.size, (int, float)) else segment.size[0]
                 flange_width = base_size
-                web_height = base_size * 1.8
-                web_thickness = base_size * 0.2
-                flange_thickness = base_size * 0.25
+                web_height = base_size * H_HEIGHT_RATIO
+                web_thickness = base_size * H_WEB_THICKNESS_RATIO
+                flange_thickness = base_size * H_FLANGE_THICKNESS_RATIO
             
             half_height = web_height / 2
             half_width = flange_width / 2
@@ -478,7 +538,7 @@ def find_closest_segment(column, point):
         
         segment_vec = end - start
         segment_len = np.linalg.norm(segment_vec)
-        segment_dir = segment_vec / segment_len if segment_len > 0 else np.array([0, 0, 1])
+        segment_dir = segment_vec / segment_len if segment_len > MIN_DIRECTION_NORM else np.array([0, 0, 1])
         
         to_point = point - start
         projection = np.dot(to_point, segment_dir)
@@ -492,14 +552,14 @@ def find_closest_segment(column, point):
             closest_idx = i
     return closest_idx
 
-def find_quality_correspondences(kinematic_pcd, deformed_pcd, distance_threshold=0.2):
+def find_quality_correspondences(kinematic_pcd, deformed_pcd, distance_threshold=ICP_MAX_CORRESPONDENCE_DISTANCE):
     """Find quality correspondences with fallbacks and filtering"""
     # Ensure normals are calculated
-    kinematic_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.15, max_nn=50))
-    deformed_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.15, max_nn=50))
+    kinematic_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=NORMALS_RADIUS, max_nn=NORMALS_MAX_NN))
+    deformed_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=NORMALS_RADIUS, max_nn=NORMALS_MAX_NN))
     
     # Use more iterations for better convergence
-    criteria = o3d.pipelines.registration.ICPConvergenceCriteria(relative_fitness=1e-6, relative_rmse=1e-6, max_iteration=50)
+    criteria = o3d.pipelines.registration.ICPConvergenceCriteria(relative_fitness=ICP_RELATIVE_FITNESS, relative_rmse=ICP_RELATIVE_RMSE, max_iteration=ICP_MAX_ITERATION)
     # Try point-to-point ICP
     try:
         result = o3d.pipelines.registration.registration_icp(kinematic_pcd, deformed_pcd, max_correspondence_distance=distance_threshold, init=np.eye(4), estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(), criteria=criteria)
@@ -523,7 +583,7 @@ def find_quality_correspondences(kinematic_pcd, deformed_pcd, distance_threshold
     return correspondences
 
 # ================== INCREMENTAL OPTIMIZATION IMPLEMENTATION ===================
-def apply_incremental_optimization(deformed_pcd, kinematic_column, max_iterations=100, error_threshold=0.001):
+def apply_incremental_optimization(deformed_pcd, kinematic_column, max_iterations=DEFAULT_MAX_ITERATIONS, error_threshold=DEFAULT_ERROR_THRESHOLD):
     frames = []
     all_errors = []
     all_rmse_values = []
@@ -534,21 +594,20 @@ def apply_incremental_optimization(deformed_pcd, kinematic_column, max_iteration
         segment_length=kinematic_column.segments[0].length, 
         size=kinematic_column.segments[0].size,
         cross_section=kinematic_column.segments[0].cross_section))
-    original_pcd.paint_uniform_color([0.7, 0.7, 0.7])  # Gray
+    original_pcd.paint_uniform_color(ORIGINAL_COLOR)  # Gray
     
     deformed_pcd_vis = copy.deepcopy(deformed_pcd)
-    deformed_pcd_vis.paint_uniform_color([0, 0, 1])    # Blue
+    deformed_pcd_vis.paint_uniform_color(DEFORMED_COLOR)    # Blue
     
     current_pcd = column_to_point_cloud(kinematic_column)
-    current_pcd.paint_uniform_color([1, 0, 0])         # Red
+    current_pcd.paint_uniform_color(CURRENT_COLOR)         # Red
     frames.append([original_pcd, deformed_pcd_vis, current_pcd])
      
     # Main optimization loop
     num_segments = len(kinematic_column.segments)
     
     # Set an initial distance threshold that will adapt
-    initial_dist_threshold = 0.3
-    dist_threshold = initial_dist_threshold
+    dist_threshold = INITIAL_DIST_THRESHOLD
     
     for iteration in range(max_iterations):
         print(f"\nIteration {iteration+1}/{max_iterations}")
@@ -558,19 +617,19 @@ def apply_incremental_optimization(deformed_pcd, kinematic_column, max_iteration
         kinematic_pcd.estimate_normals()
         
         # Adaptive distance threshold - starts higher and gradually decreases
-        dist_threshold = initial_dist_threshold * (1.0 - min(0.9, iteration / max_iterations))
+        dist_threshold = INITIAL_DIST_THRESHOLD * (1.0 - min(0.9, iteration / max_iterations))
         print(f"  Using distance threshold: {dist_threshold:.4f}")
         
         correspondences = find_quality_correspondences(kinematic_pcd, deformed_pcd, dist_threshold)
         
-        if len(correspondences) < 20:
+        if len(correspondences) < MIN_POINTS_FOR_CORRESPONDENCE * 2:
             print(f"  Warning: Only {len(correspondences)} correspondences found.")
             # Try with a more relaxed threshold just for this iteration
             temp_threshold = dist_threshold * 1.5
             print(f"  Trying with relaxed threshold: {temp_threshold:.4f}")
             correspondences = find_quality_correspondences(kinematic_pcd, deformed_pcd, temp_threshold)
             
-            if len(correspondences) < 10:
+            if len(correspondences) < MIN_POINTS_FOR_CORRESPONDENCE:
                 print("  Still insufficient correspondences. Reducing constraint weights and continuing.")
                 # We'll continue with what we have, but with gentler constraints
         
@@ -601,12 +660,12 @@ def apply_incremental_optimization(deformed_pcd, kinematic_column, max_iteration
         
         # First iteration: focus on only the closest 5% of points
         if iteration == 0:
-            closest_percentage = 0.05  
+            closest_percentage = FIRST_ITER_CLOSEST_PERCENTAGE
         else:
             # Gradually increase percentage after first iteration
             closest_percentage = 0.1 + 0.7 * ((iteration-1) / (max_iterations-1))
             
-        num_closest = max(int(len(sorted_indices) * closest_percentage), 10)
+        num_closest = max(int(len(sorted_indices) * closest_percentage), MIN_POINTS_FOR_CORRESPONDENCE)
         closest_indices = sorted_indices[:num_closest]
         
         print(f"  Focusing on {num_closest} closest points ({closest_percentage:.2%} of total)")
@@ -641,14 +700,14 @@ def apply_incremental_optimization(deformed_pcd, kinematic_column, max_iteration
             active_segments = np.where(segment_weights > 0)[0]
             if len(active_segments) == 0:
                 print("  Warning: No active segments found. Using default weights.")
-                segment_weights = np.ones(num_segments) * 0.1
+                segment_weights = np.ones(num_segments) * SEGMENT_WEIGHT_MIN
             else:
                 print(f"  First iteration active segments: {active_segments}")
         else:
             # Normal weight calculation for subsequent iterations
             # Normalize and add base weight to ensure all segments have some influence
             segment_weights = segment_counts / max(segment_counts.max(), 1) 
-            segment_weights = 0.2 + 0.8 * segment_weights  # Ensure minimum weight of 0.2
+            segment_weights = SEGMENT_WEIGHT_MIN + SEGMENT_WEIGHT_SCALE * segment_weights  # Ensure minimum weight
         
         print(f"  Segment counts: {segment_counts}")
         print(f"  Segment weights: {segment_weights}")
@@ -657,14 +716,13 @@ def apply_incremental_optimization(deformed_pcd, kinematic_column, max_iteration
         # Inverse distance weighting
         point_distances = distances[closest_indices]
         # Prevent division by zero by adding a small epsilon
-        epsilon = 1e-6
-        inv_distances = 1.0 / (point_distances + epsilon)
+        inv_distances = 1.0 / (point_distances + EPSILON)
         point_weights = inv_distances / inv_distances.max()  # Normalize to [0,1]
         
         # Apply non-linear scaling to emphasize very close points
         point_weights = point_weights ** 2  # Square to emphasize differences
         # Ensure minimum weight
-        point_weights = 0.3 + 0.7 * point_weights
+        point_weights = POINT_WEIGHT_MIN + POINT_WEIGHT_SCALE * point_weights
         
         # 9. Compute Jacobian with our weights
         J, error_vector = compute_jacobian(kinematic_column, close_source_points, close_target_points, point_weights=point_weights, segment_weights=segment_weights)
@@ -678,11 +736,11 @@ def apply_incremental_optimization(deformed_pcd, kinematic_column, max_iteration
         # Adaptive damping based on current iteration and error
         # Much higher damping in first iteration to prevent large jumps
         if iteration == 0:
-            adaptive_damping = 1.0  # Very high damping for first iteration
+            adaptive_damping = FIRST_ITER_DAMPING  # Very high damping for first iteration
         else:
             # Gradually reduce damping in later iterations
             progress_factor = min(1.0, (iteration-1) / (max_iterations * 0.7))
-            error_factor = min(1.0, current_error / (initial_dist_threshold * 10))
+            error_factor = min(1.0, current_error / (INITIAL_DIST_THRESHOLD * 10))
             adaptive_damping = 0.1 * (1.0 - progress_factor * 0.8) * (1.0 + error_factor)
         
         print(f"  Using adaptive damping: {adaptive_damping:.4f}")
@@ -693,9 +751,9 @@ def apply_incremental_optimization(deformed_pcd, kinematic_column, max_iteration
         # 11. Add directional bias to favor natural bending
         # Higher constraining for first iteration
         if iteration == 0:
-            constraint_weight = 0.1  # Stronger constraint for first iteration
+            constraint_weight = FIRST_ITER_CONSTRAINT_WEIGHT  # Stronger constraint for first iteration
         else:
-            constraint_weight = 0.02  # Lighter constraint for later iterations    
+            constraint_weight = LATER_ITER_CONSTRAINT_WEIGHT  # Lighter constraint for later iterations    
         constraint_matrix = np.eye(JTJ.shape[0]) * constraint_weight
         
         # Determine main bending direction
@@ -734,9 +792,9 @@ def apply_incremental_optimization(deformed_pcd, kinematic_column, max_iteration
         
         # First iteration: stronger continuity constraints
         if iteration == 0:
-            continuity_weight = 0.2  # Strong continuity constraint for first iteration
+            continuity_weight = FIRST_ITER_CONTINUITY_WEIGHT  # Strong continuity constraint for first iteration
         else:
-            continuity_weight = 0.05  # Normal continuity for later iterations
+            continuity_weight = LATER_ITER_CONTINUITY_WEIGHT  # Normal continuity for later iterations
         
         for i in range(1, num_segments - 1):
             # Each middle segment should ideally have a rotation similar to average of neighbors
@@ -756,17 +814,16 @@ def apply_incremental_optimization(deformed_pcd, kinematic_column, max_iteration
         delta_theta = np.linalg.solve(augmented_system, JTe)
         
         # 14. Scale motion 
-        scale_factor = 0.4 
-        delta_theta *= scale_factor
+        delta_theta *= DELTA_THETA_SCALE
 
         # 15. Apply joint limits with gradually increasing freedom
         if iteration == 0:
-            max_angle_main = np.pi/15  # Very limited for first iteration
-            max_angle_other = np.pi/20
+            max_angle_main = FIRST_ITER_MAX_ANGLE_MAIN  # Very limited for first iteration
+            max_angle_other = FIRST_ITER_MAX_ANGLE_OTHER
         else:
             max_angle_factor = min(1.0, (iteration-1) / (max_iterations * 0.6))
-            max_angle_main = (np.pi/6) * (1.0 + max_angle_factor)
-            max_angle_other = (np.pi/12) * (1.0 + max_angle_factor)
+            max_angle_main = LATER_ITER_MAX_ANGLE_MAIN * (1.0 + max_angle_factor)
+            max_angle_other = LATER_ITER_MAX_ANGLE_OTHER * (1.0 + max_angle_factor)
             
         for i in range(num_segments):
             for j in range(3):
@@ -796,7 +853,7 @@ def apply_incremental_optimization(deformed_pcd, kinematic_column, max_iteration
         # Always save the first iteration frame and less frequently after that
         if iteration == 0 or iteration % 5 == 0 or iteration == max_iterations - 1:
             current_pcd = column_to_point_cloud(kinematic_column)
-            current_pcd.paint_uniform_color([1, 0, 0])
+            current_pcd.paint_uniform_color(CURRENT_COLOR)
             frames.append([original_pcd, deformed_pcd_vis, current_pcd])
         
         # 18. Check for early convergence (but not in first few iterations)
@@ -819,7 +876,7 @@ def apply_incremental_optimization(deformed_pcd, kinematic_column, max_iteration
     
     # Final result
     final_pcd = column_to_point_cloud(kinematic_column)
-    final_pcd.paint_uniform_color([0, 1, 0])  # Green for final result
+    final_pcd.paint_uniform_color(FINAL_COLOR)  # Green for final result
     frames.append([original_pcd, deformed_pcd_vis, final_pcd])
     
     return kinematic_column, all_errors, frames, all_rmse_values
@@ -921,7 +978,7 @@ def plot_node_displacements(original_column, result_column):
 
 def run_incremental_optimization_experiment(cross_section='circular', size=0.1):
     # Set random seed for reproducibility
-    np.random.seed(42)
+    np.random.seed(RANDOM_SEED)
     
     # For rectangular cross-section, use a tuple for size
     if cross_section.lower() == 'rectangular' and not isinstance(size, tuple):
@@ -947,7 +1004,7 @@ def run_incremental_optimization_experiment(cross_section='circular', size=0.1):
     # Run incremental optimization
     print("Running incremental optimization...")
     start_time = time.time()
-    result_column, errors, frames, rmse_values = apply_incremental_optimization(deformed_pcd, kinematic_column, max_iterations=100, error_threshold=0.001)
+    result_column, errors, frames, rmse_values = apply_incremental_optimization(deformed_pcd, kinematic_column, max_iterations=DEFAULT_MAX_ITERATIONS, error_threshold=DEFAULT_ERROR_THRESHOLD)
     elapsed_time = time.time() - start_time
     print(f"Optimization completed in {elapsed_time:.2f} seconds")
     
