@@ -413,4 +413,596 @@ def calculate_rmse(source_points, target_points):
     rmse = np.sqrt(mean_squared_diff)
     return rmse
 
-# ===
+# ================== JACOBIAN AND POINT MATCHING ===================
+def compute_jacobian(column, source_points, target_points, point_weights=None, segment_weights=None):
+    """Compute the Jacobian matrix with weighted influences"""
+    num_segments = len(column.segments)
+    num_points = len(source_points)
+    num_params = num_segments * 3
+    
+    # Initialize Jacobian and error
+    J = np.zeros((num_points * 3, num_params))
+    error_vectors = target_points - source_points
+    error = error_vectors.flatten()
+    
+    # Default weights if not provided
+    if point_weights is None:
+        point_weights = np.ones(num_points)
+        
+    if segment_weights is None:
+        segment_weights = np.ones(num_segments)
+    
+    # Find which segment each point belongs to
+    point_segments = np.zeros(num_points, dtype=int)
+    for i, point in enumerate(source_points):
+        point_segments[i] = find_closest_segment(column, point)
+    
+    # For each point, calculate Jacobian entries
+    for i, point in enumerate(source_points):
+        closest_segment_idx = point_segments[i]
+        point_weight = point_weights[i]
+        
+        # Calculate entries for all segments that affect this point
+        for j in range(closest_segment_idx + 1):
+            segment = column.segments[j]
+            segment_weight = segment_weights[j]
+            combined_weight = point_weight * segment_weight
+            
+            # For each rotation axis
+            for k in range(3):
+                param_idx = j * 3 + k
+                
+                # Get rotation axis in world space
+                if k == 0:  # x-axis
+                    rotation_axis = segment.orientation @ np.array([1, 0, 0])
+                elif k == 1:  # y-axis
+                    rotation_axis = segment.orientation @ np.array([0, 1, 0])
+                else:  # z-axis
+                    rotation_axis = segment.orientation @ np.array([0, 0, 1])
+                
+                # ICPIK formula: J = v_j × (s_i - p_j)
+                cross_product = np.cross(rotation_axis, point - segment.start_pos)
+                J[i*3:i*3+3, param_idx] = cross_product * combined_weight
+    
+    return J, error
+
+def find_closest_segment(column, point):
+    """Find the index of the closest segment to a given point"""
+    closest_idx = 0
+    min_dist = float('inf')
+    
+    for i, segment in enumerate(column.segments):
+        # Calculate distance to segment line
+        start = segment.start_pos
+        end = segment.end_pos
+        
+        segment_vec = end - start
+        segment_len = np.linalg.norm(segment_vec)
+        segment_dir = segment_vec / segment_len if segment_len > 0 else np.array([0, 0, 1])
+        
+        to_point = point - start
+        projection = np.dot(to_point, segment_dir)
+        projection = max(0, min(segment_len, projection))
+        
+        closest_point = start + projection * segment_dir
+        dist = np.linalg.norm(point - closest_point)
+        
+        if dist < min_dist:
+            min_dist = dist
+            closest_idx = i
+    return closest_idx
+
+def find_quality_correspondences(kinematic_pcd, deformed_pcd, distance_threshold=0.2):
+    """Find quality correspondences with fallbacks and filtering"""
+    # Ensure normals are calculated
+    kinematic_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.15, max_nn=50))
+    deformed_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.15, max_nn=50))
+    
+    # Use more iterations for better convergence
+    criteria = o3d.pipelines.registration.ICPConvergenceCriteria(relative_fitness=1e-6, relative_rmse=1e-6, max_iteration=50)
+    # Try point-to-point ICP
+    try:
+        result = o3d.pipelines.registration.registration_icp(kinematic_pcd, deformed_pcd, max_correspondence_distance=distance_threshold, init=np.eye(4), estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(), criteria=criteria)
+        correspondences = np.asarray(result.correspondence_set)
+    except Exception as e:
+        print(f"Point-to-point ICP failed: {e}")
+        correspondences = np.array([])  # Empty array instead of None
+    
+    # If too few correspondences, try with relaxed parameters
+    if len(correspondences) < 100:
+        print(f"  Warning: {len(correspondences)} correspondences found. Trying relaxed parameters...")
+        distance_threshold *= 1.5  # Increase the threshold to capture more matches
+        try:
+            result = o3d.pipelines.registration.registration_icp(kinematic_pcd, deformed_pcd, max_correspondence_distance=distance_threshold, init=np.eye(4), estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(), criteria=criteria)
+            correspondences = np.asarray(result.correspondence_set)
+        except Exception as e:
+            print(f"Relaxed ICP failed: {e}")
+            correspondences = np.array([])  # Empty array instead of None
+    
+    print(f'Number of correspondences found: {len(correspondences)}')
+    return correspondences
+
+# ================== INCREMENTAL OPTIMIZATION IMPLEMENTATION ===================
+def apply_incremental_optimization(deformed_pcd, kinematic_column, max_iterations=100, error_threshold=0.001):
+    frames = []
+    all_errors = []
+    all_rmse_values = []
+    
+    #visualization
+    original_pcd = column_to_point_cloud(ArticulatedColumn(
+        num_segments=len(kinematic_column.segments), 
+        segment_length=kinematic_column.segments[0].length, 
+        size=kinematic_column.segments[0].size,
+        cross_section=kinematic_column.segments[0].cross_section))
+    original_pcd.paint_uniform_color([0.7, 0.7, 0.7])  # Gray
+    
+    deformed_pcd_vis = copy.deepcopy(deformed_pcd)
+    deformed_pcd_vis.paint_uniform_color([0, 0, 1])    # Blue
+    
+    current_pcd = column_to_point_cloud(kinematic_column)
+    current_pcd.paint_uniform_color([1, 0, 0])         # Red
+    frames.append([original_pcd, deformed_pcd_vis, current_pcd])
+     
+    # Main optimization loop
+    num_segments = len(kinematic_column.segments)
+    
+    # Set an initial distance threshold that will adapt
+    initial_dist_threshold = 0.3
+    dist_threshold = initial_dist_threshold
+    
+    for iteration in range(max_iterations):
+        print(f"\nIteration {iteration+1}/{max_iterations}")
+        
+        # 1. Find correspondences
+        kinematic_pcd = column_to_point_cloud(kinematic_column)
+        kinematic_pcd.estimate_normals()
+        
+        # Adaptive distance threshold - starts higher and gradually decreases
+        dist_threshold = initial_dist_threshold * (1.0 - min(0.9, iteration / max_iterations))
+        print(f"  Using distance threshold: {dist_threshold:.4f}")
+        
+        correspondences = find_quality_correspondences(kinematic_pcd, deformed_pcd, dist_threshold)
+        
+        if len(correspondences) < 20:
+            print(f"  Warning: Only {len(correspondences)} correspondences found.")
+            # Try with a more relaxed threshold just for this iteration
+            temp_threshold = dist_threshold * 1.5
+            print(f"  Trying with relaxed threshold: {temp_threshold:.4f}")
+            correspondences = find_quality_correspondences(kinematic_pcd, deformed_pcd, temp_threshold)
+            
+            if len(correspondences) < 10:
+                print("  Still insufficient correspondences. Reducing constraint weights and continuing.")
+                # We'll continue with what we have, but with gentler constraints
+        
+        # 2. Get source and target points
+        kinematic_points = np.asarray(kinematic_pcd.points)
+        deformed_points = np.asarray(deformed_pcd.points)
+        source_points = kinematic_points[correspondences[:, 0]]
+        target_points = deformed_points[correspondences[:, 1]]
+
+        rmse = calculate_rmse(source_points, target_points)
+        print(f"  RMSE: {rmse:.6f}")
+        all_rmse_values.append(rmse)
+        
+        # 3. Calculate distances between corresponding points
+        distances = np.linalg.norm(target_points - source_points, axis=1)
+        avg_distance = np.mean(distances)
+        max_distance = np.max(distances)
+        
+        print(f"  Average distance: {avg_distance:.6f}, Max distance: {max_distance:.6f}")
+        
+        # Early termination check
+        if max_distance < error_threshold:
+            print(f"  Reached error threshold ({error_threshold}). Terminating early.")
+            break
+        
+        # 4. Sort points by distance (smallest first)
+        sorted_indices = np.argsort(distances)
+        
+        # First iteration: focus on only the closest 5% of points
+        if iteration == 0:
+            closest_percentage = 0.05  
+        else:
+            # Gradually increase percentage after first iteration
+            closest_percentage = 0.1 + 0.7 * ((iteration-1) / (max_iterations-1))
+            
+        num_closest = max(int(len(sorted_indices) * closest_percentage), 10)
+        closest_indices = sorted_indices[:num_closest]
+        
+        print(f"  Focusing on {num_closest} closest points ({closest_percentage:.2%} of total)")
+        
+        # 5. Filter to just the closest points
+        close_source_points = source_points[closest_indices]
+        close_target_points = target_points[closest_indices]
+        
+        # 6. Identify which segments these points belong to
+        point_segments = np.zeros(len(close_source_points), dtype=int)
+        for i, point in enumerate(close_source_points):
+            point_segments[i] = find_closest_segment(kinematic_column, point)
+            
+        # Print the distribution of closest points across segments
+        seg_distribution = np.bincount(point_segments, minlength=num_segments)
+        print(f"  Distribution of closest points by segment: {seg_distribution}")
+        
+        # 7. Calculate segment participation weights
+        # Segments with more close points get higher priority
+        segment_counts = np.zeros(num_segments)
+        for seg_idx in point_segments:
+            segment_counts[seg_idx] += 1
+        
+        if iteration == 0:
+            # Give higher weights to segments with more points and zero weight to segments with no points
+            segment_weights = np.zeros(num_segments)
+            for i in range(num_segments):
+                if segment_counts[i] > 0:
+                    segment_weights[i] = 1.0  # Uniform weight for segments with points
+                    
+            # Filter out segments with zero weights to prevent unnecessary movement
+            active_segments = np.where(segment_weights > 0)[0]
+            if len(active_segments) == 0:
+                print("  Warning: No active segments found. Using default weights.")
+                segment_weights = np.ones(num_segments) * 0.1
+            else:
+                print(f"  First iteration active segments: {active_segments}")
+        else:
+            # Normal weight calculation for subsequent iterations
+            # Normalize and add base weight to ensure all segments have some influence
+            segment_weights = segment_counts / max(segment_counts.max(), 1) 
+            segment_weights = 0.2 + 0.8 * segment_weights  # Ensure minimum weight of 0.2
+        
+        print(f"  Segment counts: {segment_counts}")
+        print(f"  Segment weights: {segment_weights}")
+        
+        # 8. Calculate point weights - give more weight to closer points
+        # Inverse distance weighting
+        point_distances = distances[closest_indices]
+        # Prevent division by zero by adding a small epsilon
+        epsilon = 1e-6
+        inv_distances = 1.0 / (point_distances + epsilon)
+        point_weights = inv_distances / inv_distances.max()  # Normalize to [0,1]
+        
+        # Apply non-linear scaling to emphasize very close points
+        point_weights = point_weights ** 2  # Square to emphasize differences
+        # Ensure minimum weight
+        point_weights = 0.3 + 0.7 * point_weights
+        
+        # 9. Compute Jacobian with our weights
+        J, error_vector = compute_jacobian(kinematic_column, close_source_points, close_target_points, point_weights=point_weights, segment_weights=segment_weights)
+        current_error = np.linalg.norm(error_vector)
+        all_errors.append(current_error) 
+        print(f"  Error after focusing on closest points: {current_error:.6f}")
+        
+        # 10. Solve using Damped Least Squares with adaptive damping
+        JTJ = J.T @ J
+        
+        # Adaptive damping based on current iteration and error
+        # Much higher damping in first iteration to prevent large jumps
+        if iteration == 0:
+            adaptive_damping = 1.0  # Very high damping for first iteration
+        else:
+            # Gradually reduce damping in later iterations
+            progress_factor = min(1.0, (iteration-1) / (max_iterations * 0.7))
+            error_factor = min(1.0, current_error / (initial_dist_threshold * 10))
+            adaptive_damping = 0.1 * (1.0 - progress_factor * 0.8) * (1.0 + error_factor)
+        
+        print(f"  Using adaptive damping: {adaptive_damping:.4f}")
+        
+        lambda_I = adaptive_damping * np.eye(JTJ.shape[0])
+        JTe = J.T @ error_vector
+        
+        # 11. Add directional bias to favor natural bending
+        # Higher constraining for first iteration
+        if iteration == 0:
+            constraint_weight = 0.1  # Stronger constraint for first iteration
+        else:
+            constraint_weight = 0.02  # Lighter constraint for later iterations    
+        constraint_matrix = np.eye(JTJ.shape[0]) * constraint_weight
+        
+        # Determine main bending direction
+        error_directions = close_target_points - close_source_points
+        mean_direction = np.mean(np.abs(error_directions), axis=0)
+        main_axis = np.argmax(mean_direction)
+        secondary_axes = [i for i in range(3) if i != main_axis]
+        
+        # Determine proper direction of bend
+        mean_error_direction = np.mean(error_directions, axis=0)
+        main_axis_direction = np.sign(mean_error_direction[main_axis])
+        print(f"  Main bending axis: {main_axis} (0=X, 1=Y, 2=Z) with direction: {main_axis_direction}")
+        
+        # Apply axis-specific constraints
+        for i in range(num_segments):
+            # First iteration: Apply constraint to all segments
+            if iteration == 0:
+                # For first iteration, only reduce constraint on segments with points
+                if segment_counts[i] > 0:
+                    constraint_matrix[i*3 + main_axis, i*3 + main_axis] *= 0.5
+                    
+                # Keep strong constraints on other axes
+                for j in secondary_axes:
+                    constraint_matrix[i*3 + j, i*3 + j] *= 2.0
+            else:
+                # Later iterations: standard constraints
+                # Less constraint on main bending axis
+                constraint_matrix[i*3 + main_axis, i*3 + main_axis] *= 0.5
+                
+                # More constraint on other axes to discourage unnecessary rotation
+                for j in secondary_axes:
+                    constraint_matrix[i*3 + j, i*3 + j] *= 2.0
+                
+        # 12. Add continuity constraints to encourage smooth bending
+        continuity_matrix = np.zeros(JTJ.shape)
+        
+        # First iteration: stronger continuity constraints
+        if iteration == 0:
+            continuity_weight = 0.2  # Strong continuity constraint for first iteration
+        else:
+            continuity_weight = 0.05  # Normal continuity for later iterations
+        
+        for i in range(1, num_segments - 1):
+            # Each middle segment should ideally have a rotation similar to average of neighbors
+            for axis in range(3):
+                # Penalize deviation from average of neighboring segments
+                curr_idx = i * 3 + axis
+                prev_idx = (i-1) * 3 + axis
+                next_idx = (i+1) * 3 + axis
+                
+                # Add entries to penalize deviation from average of neighbors
+                continuity_matrix[curr_idx, curr_idx] += 2 * continuity_weight
+                continuity_matrix[curr_idx, prev_idx] -= continuity_weight
+                continuity_matrix[curr_idx, next_idx] -= continuity_weight
+        
+        # 13. Solve the system with all constraints
+        augmented_system = JTJ + lambda_I + constraint_matrix + continuity_matrix
+        delta_theta = np.linalg.solve(augmented_system, JTe)
+        
+        # 14. Scale motion 
+        scale_factor = 0.4 
+        delta_theta *= scale_factor
+
+        # 15. Apply joint limits with gradually increasing freedom
+        if iteration == 0:
+            max_angle_main = np.pi/15  # Very limited for first iteration
+            max_angle_other = np.pi/20
+        else:
+            max_angle_factor = min(1.0, (iteration-1) / (max_iterations * 0.6))
+            max_angle_main = (np.pi/6) * (1.0 + max_angle_factor)
+            max_angle_other = (np.pi/12) * (1.0 + max_angle_factor)
+            
+        for i in range(num_segments):
+            for j in range(3):
+                param_idx = i * 3 + j
+                # Use appropriate angle limit based on axis
+                if j == main_axis:
+                    max_angle = max_angle_main
+                else:
+                    max_angle = max_angle_other               
+                current_angle = kinematic_column.segments[i].local_rotation[j]
+                new_angle = current_angle + delta_theta[param_idx]
+                if abs(new_angle) > max_angle:
+                    # Clip to the limit
+                    delta_theta[param_idx] = np.sign(new_angle) * max_angle - current_angle
+                    if iteration == 0:  # Only log these warnings in first iteration to avoid spam
+                        print(f"  Limiting segment {i}, axis {j} to {max_angle:.4f} radians")
+        
+        # 16. Apply changes to the kinematic model
+        for i in range(num_segments):
+            segment = kinematic_column.segments[i]
+            for j in range(3):
+                param_idx = i * 3 + j
+                segment.local_rotation[j] += delta_theta[param_idx]
+            segment.update_transform()
+        
+        # 17. Save frame for visualization
+        # Always save the first iteration frame and less frequently after that
+        if iteration == 0 or iteration % 5 == 0 or iteration == max_iterations - 1:
+            current_pcd = column_to_point_cloud(kinematic_column)
+            current_pcd.paint_uniform_color([1, 0, 0])
+            frames.append([original_pcd, deformed_pcd_vis, current_pcd])
+        
+        # 18. Check for early convergence (but not in first few iterations)
+        if iteration > 10 and current_error < error_threshold * 2:
+            # If we're getting close, do a full evaluation
+            kinematic_pcd = column_to_point_cloud(kinematic_column)
+            full_correspondences = find_quality_correspondences(kinematic_pcd, deformed_pcd, dist_threshold * 0.5)
+            
+            if len(full_correspondences) > 0:
+                full_source = kinematic_points[full_correspondences[:, 0]]
+                full_target = deformed_points[full_correspondences[:, 1]]
+                full_distances = np.linalg.norm(full_target - full_source, axis=1)
+                full_max_error = np.max(full_distances)
+                
+                print(f"  Full evaluation max error: {full_max_error:.6f}")
+                
+                if full_max_error < error_threshold:
+                    print("  Early convergence achieved. Terminating.")
+                    break
+    
+    # Final result
+    final_pcd = column_to_point_cloud(kinematic_column)
+    final_pcd.paint_uniform_color([0, 1, 0])  # Green for final result
+    frames.append([original_pcd, deformed_pcd_vis, final_pcd])
+    
+    return kinematic_column, all_errors, frames, all_rmse_values
+
+def calculate_result_vs_groundtruth_error(deformed_column, result_column):
+    """Calculate the distance between the ICPIK result and ground truth for each node"""
+    num_segments = len(deformed_column.segments)
+    node_indices = list(range(num_segments))
+    errors = []
+    
+    for i in range(num_segments):
+        # Calculate the Euclidean distance between result and ground truth positions
+        gt_pos = deformed_column.segments[i].end_pos
+        result_pos = result_column.segments[i].end_pos
+        
+        # Calculate distance
+        distance = np.linalg.norm(result_pos - gt_pos)
+        errors.append(distance)
+        
+        print(f"Node {i}: Ground Truth position: {gt_pos}, Result position: {result_pos}, Error: {distance:.4f}")
+    
+    return node_indices, errors
+
+def plot_result_vs_groundtruth_error(deformed_column, result_column):
+    """Plot the distance between ICPIK result and ground truth for each node"""
+    node_indices, errors = calculate_result_vs_groundtruth_error(deformed_column, result_column)
+    
+    plt.figure(figsize=(12, 6))
+    plt.bar(node_indices, errors, color='skyblue', alpha=0.7)
+    plt.plot(node_indices, errors, 'ro-', linewidth=2)
+    plt.xlabel('Node Number', fontsize=20)
+    plt.ylabel('Euclidean Distance', fontsize=20)
+    plt.title('Distance Between ICPIK Result and Ground Truth for Each Node', fontsize=24, pad=20)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    # Set y-axis limit to 0.05
+    plt.ylim(0, 0.8)
+    # Set small font size for tick numbers
+    plt.xticks(node_indices, fontsize=10)  # Small font for x-axis tick labels
+    plt.yticks(fontsize=10)  # Small font for y-axis tick labels
+    # Add error values above each bar with a moderate font size
+    for i, d in enumerate(errors):
+        plt.text(i, d + 0.001, f'{d:.3f}', ha='center', fontsize=10)  # Adjusted vertical offset
+    plt.tight_layout()
+    plt.show()
+    return node_indices, errors
+#node calc
+
+def calculate_node_displacements(original_column, result_column):
+
+    num_segments = len(original_column.segments)
+    node_indices = list(range(num_segments))
+    displacements = []
+    
+    for i in range(num_segments):
+        # Calculate displacement at the end position of each segment
+        original_pos = original_column.segments[i].end_pos
+        result_pos = result_column.segments[i].end_pos
+        
+        # Calculate Euclidean distance
+        distance = np.linalg.norm(result_pos - original_pos)
+        displacements.append(distance)
+        
+        print(f"Node {i}: Original position: {original_pos}, Result position: {result_pos}, Distance: {distance:.4f}")
+    
+    return node_indices, displacements
+
+def plot_node_displacements(original_column, result_column):
+    """
+    Plot the Euclidean distance between corresponding nodes in the original and result columns.
+    
+    Args:
+        original_column: The initial straight column
+        result_column: The final deformed column after optimization
+    """
+    node_indices, displacements = calculate_node_displacements(original_column, result_column)
+    
+    plt.figure(figsize=(12, 6))
+    plt.bar(node_indices, displacements, color='skyblue', alpha=0.7)
+    plt.plot(node_indices, displacements, 'ro-', linewidth=2)
+    plt.xlabel('Node Number', fontsize=20)
+    plt.ylabel('Euclidean Distance', fontsize=20)
+    plt.title('Displacement between Original and Deformed Column Nodes', fontsize=24, pad=20)
+    plt.grid(True, linestyle='--', alpha=0.7)
+
+    # Set small font size for tick numbers
+    plt.xticks(node_indices, fontsize=10)  # Small font for x-axis tick labels
+    plt.yticks(fontsize=10)  # Small font for y-axis tick labels
+
+    # Add displacement values above each bar with a moderate font size
+    for i, d in enumerate(displacements):
+        plt.text(i, d + 0.01, f'{d:.3f}', ha='center', fontsize=10)  # Set font size for the data labels
+
+    plt.tight_layout()
+    plt.show()
+    return node_indices, displacements
+
+
+#Experiement
+
+def run_incremental_optimization_experiment(cross_section='circular', size=0.1):
+    # Set random seed for reproducibility
+    np.random.seed(42)
+    
+    # For rectangular cross-section, use a tuple for size
+    if cross_section.lower() == 'rectangular' and not isinstance(size, tuple):
+        size = (size, size * 0.8)  # Default to a non-square rectangle if not specified
+    
+    # Create original column (straight)
+    original_column = ArticulatedColumn(num_segments=10, segment_length=0.25, size=size, cross_section=cross_section)
+    
+    # Create ground truth deformed column with a clear bend
+    deformed_column = copy.deepcopy(original_column)
+
+    deformed_column.bend_at_segment(9, 'y', np.pi/24)
+    deformed_column.bend_at_segment(8, 'y', np.pi/20)
+    deformed_column.bend_at_segment(7, 'y', np.pi/20)
+    deformed_column.bend_at_segment(6, 'y', np.pi/24)
+    
+    # Create point cloud from the deformed column
+    deformed_pcd = column_to_point_cloud(deformed_column, total_points=10000)
+    
+    # Create a kinematic model starting from straight position
+    kinematic_column = copy.deepcopy(original_column)
+    
+    # Run incremental optimization
+    print("Running incremental optimization...")
+    start_time = time.time()
+    result_column, errors, frames, rmse_values = apply_incremental_optimization(deformed_pcd, kinematic_column, max_iterations=100, error_threshold=0.001)
+    elapsed_time = time.time() - start_time
+    print(f"Optimization completed in {elapsed_time:.2f} seconds")
+    
+    plt.figure(figsize=(12, 6))
+    plt.plot(rmse_values, 'b-', linewidth=2)  # Blue line
+    plt.yscale('log')
+    plt.ylim(bottom=None, top=1e-1)  # Keep the bottom limit automatic, set top to 0.1
+    plt.xlabel('Iteration', fontsize=20)
+    plt.ylabel('RMSE', fontsize=20)
+    plt.title('Root Mean Square Error (RMSE) per Iteration', fontsize=24, pad=20)
+    y_ticks = [5e-3, 1e-2, 2e-2, 5e-2, 1e-1, 5e-1]  # Values up to 1e-1
+    plt.yticks(y_ticks, ['{:.0e}'.format(y) for y in y_ticks], fontsize=10)
+    plt.xticks(fontsize=10)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    ax = plt.gca()
+    ax.minorticks_on()
+    # Add minor grid (optional)
+    ax.grid(which='minor', linestyle=':', alpha=0.4)
+    plt.tight_layout()
+    plt.show()
+
+    node_indices, displacements = calculate_node_displacements(original_column, result_column)
+    node_indices, errors = calculate_result_vs_groundtruth_error(deformed_column, result_column)
+
+    plot_node_displacements(original_column, result_column)
+    plot_result_vs_groundtruth_error(deformed_column, result_column)
+
+    # Final visualization with OpenCascade
+    display, start_display, _, _ = init_display()
+    
+    # Original column (white)
+    for segment in original_column.segments:
+        shape = segment.create_geometry()
+        display.DisplayShape(shape, color="WHITE", update=False)
+    
+    # Deformed column (blue)
+    for segment in deformed_column.segments:
+        shape = segment.create_geometry()
+        display.DisplayShape(shape, color="BLUE", update=False)
+    
+    # Result column (green)
+    for segment in result_column.segments:
+        shape = segment.create_geometry()
+        display.DisplayShape(shape, color="GREEN", update=True)
+    
+    display.FitAll()
+    start_display() 
+    return original_column, deformed_column, result_column, errors, rmse_values, frames, node_indices, displacements
+
+
+if __name__ == "__main__":
+    # Run with the new incremental optimization approach
+    print("Running experiment with incremental optimization and circular cross-section...")
+    original_column, deformed_column, result_column, errors, rmse_values, frames, node_indices, displacements = run_incremental_optimization_experiment(cross_section='h', size=(0.276, 0.261, 0.0153, 0.0253)  # (flange_width, web_height, web_thickness, flange_thickness)
+)
+
+#print("\nRunning experiment with incremental optimization and rectangular cross-section...")
+#run_incremental_optimization_experiment(cross_section='rectangular', size=(0.2, 0.4))
