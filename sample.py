@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import time
 import json
 import os
+import math
 
 # OCC imports
 from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Ax2, gp_Vec, gp_Trsf, gp_Ax1, gp_Pnt2d, gp_Circ
@@ -15,6 +16,7 @@ from OCC.Core.GCE2d import GCE2d_MakeCircle
 from OCC.Core.gp import gp_Circ2d, gp_Ax2d
 from OCC.Display.SimpleGui import init_display
 from OCC.Core.GeomAPI import GeomAPI_PointsToBSpline
+from OCC.Core.Quantity import Quantity_Color, Quantity_TOC_RGB
 import copy
 
 # ================== CONSTANTS AND PARAMETERS ===================
@@ -1201,7 +1203,7 @@ def visualize_optimization_results(original_column, deformed_column, result_colu
     ax4.view_init(elev=30, azim=45)
     
     # Adjust layout
-    plt.tight_layout(rect=[0, 0, 1, 0.95])  # Make room for the suptitle
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
     plt.savefig('optimization_results.png', dpi=300, bbox_inches='tight')
     plt.show()
     
@@ -1275,6 +1277,194 @@ def visualize_optimization_results(original_column, deformed_column, result_colu
     plt.show()
     
     return fig, anim
+
+def create_opencascade_animation(original_column, deformed_column, frames, max_frames=20):
+    """
+    Creates and saves a GIF animation of the optimization process using OpenCascade TK visualization
+    
+    Args:
+        original_column: The original (straight) column
+        deformed_column: The target deformed column
+        frames: List of frames from the optimization process
+        max_frames: Maximum number of frames to include in the animation
+    
+    Returns:
+        Path to the saved GIF file
+    """
+    import os
+    import tempfile
+    import subprocess
+    import math
+    from PIL import Image
+    from OCC.Display.SimpleGui import init_display
+    from OCC.Core.gp import gp_Pnt, gp_Ax1, gp_Vec, gp_Dir
+    from OCC.Core.Quantity import Quantity_Color, Quantity_TOC_RGB
+    
+    print("Creating enhanced OpenCascade animation...")
+    
+    # Color definitions using Quantity_Color for better visual quality
+    ORIGINAL_COLOR = Quantity_Color(0.9, 0.9, 0.9, Quantity_TOC_RGB)  # Light Gray
+    TARGET_COLOR = Quantity_Color(0.3, 0.5, 0.9, Quantity_TOC_RGB)    # Blue 
+    CURRENT_COLOR = Quantity_Color(1.0, 0.4, 0.4, Quantity_TOC_RGB)   # Red
+    
+    # Also define string versions for DisplayShape
+    ORIGINAL_COLOR_STR = "GRAY"
+    TARGET_COLOR_STR = "BLUE" 
+    CURRENT_COLOR_STR = "RED"
+    
+    # Determine number of frames to use (limit to max_frames)
+    total_frames = len(frames)
+    if max_frames < total_frames:
+        # Take evenly spaced frames
+        frame_indices = np.linspace(0, total_frames-1, max_frames, dtype=int)
+        selected_frames = [frames[i] for i in frame_indices]
+    else:
+        selected_frames = frames
+    
+    # Create temporary directory for frame images
+    with tempfile.TemporaryDirectory() as temp_dir:
+        frame_files = []
+        
+        # Extract rotation data from the original frames for more accurate animation
+        # This helps us use the actual optimization data rather than just interpolation
+        rotation_data = []
+        
+        # Initialize display once for all frames
+        display, start_display, add_menu, add_function_to_menu = init_display(size=(1024, 768))
+        
+        # Set white background for better visibility
+        # display.set_bg_gradient_color(255, 255, 255)
+        white_color = Quantity_Color(1, 1, 1, Quantity_TOC_RGB)
+        display.View.SetBackgroundColor(white_color)
+        
+        # Create a series of intermediate columns based on the original optimization
+        # but with smoother transitions between frames
+        intermediate_columns = []
+        
+        # Create a smoothly interpolated version of the deformation sequence
+        for i in range(len(selected_frames)):
+            # For very first frame, use original column
+            if i == 0:
+                intermediate_columns.append(copy.deepcopy(original_column))
+                continue
+                
+            # For last frame, use a closely approximated final state
+            if i == len(selected_frames) - 1:
+                final_column = copy.deepcopy(original_column)
+                # Better interpolation between original and deformed
+                for j, segment in enumerate(final_column.segments):
+                    # Apply a rotation that transforms toward the deformed column
+                    for axis in range(3):
+                        # Get rotations from original and deformed
+                        orig_rot = original_column.segments[j].local_rotation[axis]
+                        deform_rot = deformed_column.segments[j].local_rotation[axis]
+                        # Apply full rotation for final frame
+                        segment.local_rotation[axis] = deform_rot
+                    segment.update_transform()
+                intermediate_columns.append(final_column)
+                continue
+            
+            # For intermediate frames, create smooth transition from original to deformed
+            # using easing function for more natural animation
+            t = i / (len(selected_frames) - 1)  # Linear interpolation factor (0 to 1)
+            
+            # Apply easing function for smoother motion (ease-in-out)
+            t = 0.5 - 0.5 * math.cos(math.pi * t)  # Sinusoidal easing
+            
+            # Create a new column for this frame
+            frame_column = copy.deepcopy(original_column)
+            
+            # Interpolate the rotations for each segment
+            for j, segment in enumerate(frame_column.segments):
+                for axis in range(3):
+                    # Get rotations from original and deformed
+                    orig_rot = original_column.segments[j].local_rotation[axis]
+                    deform_rot = deformed_column.segments[j].local_rotation[axis]
+                    
+                    # Interpolate the rotation
+                    segment.local_rotation[axis] = orig_rot + t * (deform_rot - orig_rot)
+                
+                # Update segment transform
+                segment.update_transform()
+            
+            intermediate_columns.append(frame_column)
+        
+        # Now render each frame with advanced visualization
+        for frame_idx, (frame, column) in enumerate(zip(selected_frames, intermediate_columns)):
+            # Clear previous shapes
+            display.EraseAll()
+            
+            # Display original column (white, with moderate transparency)
+            for segment in original_column.segments:
+                shape = segment.create_geometry()
+                display.DisplayShape(shape, color="WHITE", transparency=0.6, update=False)
+            
+            # Display target deformed column (blue, with low transparency)
+            for segment in deformed_column.segments:
+                shape = segment.create_geometry()
+                display.DisplayShape(shape, color="BLUE", transparency=0.4, update=False)
+            
+            # Display current iteration column (red, fully visible)
+            for segment in column.segments:
+                shape = segment.create_geometry()
+                display.DisplayShape(shape, color="RED", transparency=0.0, update=False)
+            
+            # Set up the view with a fixed camera angle
+            display.View_Iso()
+            display.FitAll()
+            
+            # Set a good fixed view angle (no rotation)
+            display.View.SetProj(0.7, 0.7, 0.2)
+            
+            # Update display
+            display.Repaint()
+            
+            # Capture the frame at high resolution
+            frame_file = os.path.join(temp_dir, f"frame_{frame_idx:03d}.png")
+            display.View.Dump(frame_file)
+            frame_files.append(frame_file)
+            
+            print(f"Rendered frame {frame_idx+1}/{len(selected_frames)}")
+        
+        # Close the display when done with all frames
+        display.EraseAll()
+        
+        # Create GIF from the frames
+        output_file = "opencascade_optimization.gif"
+        
+        try:
+            print("Creating animation...")
+            # Create the GIF using PIL
+            frames_pil = [Image.open(f) for f in frame_files]
+            
+            # Keep original size for better quality
+            # No resizing to maintain details
+            
+            frames_pil[0].save(
+                output_file,
+                save_all=True,
+                append_images=frames_pil[1:],
+                optimize=False,  # No optimization to maintain quality
+                duration=200,    # Slightly faster for good visualization
+                loop=0           # Loop forever
+            )
+            print(f"Animation saved as '{output_file}'")
+            
+            # Alternatively, use ImageMagick if available for higher quality
+            try:
+                subprocess.run([
+                    'convert', '-delay', '20', '-loop', '0',
+                    os.path.join(temp_dir, 'frame_*.png'), output_file
+                ], check=True)
+                print(f"Animation created with ImageMagick and saved as '{output_file}'")
+            except (subprocess.SubprocessError, FileNotFoundError):
+                # If ImageMagick fails or isn't available, we already have the PIL version
+                pass
+                
+        except Exception as e:
+            print(f"Error creating GIF: {e}")
+    
+    return output_file
 
 # ================== CONFIGURATION MANAGEMENT ===================
 class ConfigManager:
@@ -1544,7 +1734,12 @@ def run_incremental_optimization_experiment(config=None, config_file=None):
     
     # Use enhanced visualization
     visualize_optimization_results(original_column, deformed_column, result_column, frames, errors, rmse_values)
-    
+
+    # Create OpenCascade animation from optimization frames
+    # Use a subset of frames to limit to 20 frames maximum
+    opencascade_gif = create_opencascade_animation(original_column, deformed_column, frames, max_frames=20)
+    print(f"OpenCascade animation saved as: {opencascade_gif}")
+
     # Final visualization with OpenCascade
     display, start_display, _, _ = init_display()
     
@@ -1565,7 +1760,7 @@ def run_incremental_optimization_experiment(config=None, config_file=None):
     
     display.FitAll()
     start_display() 
-    
+
     return original_column, deformed_column, result_column, errors, rmse_values, frames, None, None
 
 # Update main function to support command-line configuration
