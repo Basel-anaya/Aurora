@@ -1305,8 +1305,8 @@ def create_opencascade_animation(original_column, deformed_column, frames, max_f
     # Color definitions using Quantity_Color for better visual quality
     ORIGINAL_COLOR = Quantity_Color(0.9, 0.9, 0.9, Quantity_TOC_RGB)  # Light Gray
     TARGET_COLOR = Quantity_Color(0.3, 0.5, 0.9, Quantity_TOC_RGB)    # Blue 
-    CURRENT_COLOR = Quantity_Color(1.0, 0.4, 0.4, Quantity_TOC_RGB)   # Red
-    
+    CURRENT_COLOR = Quantity_Color( 0, 1, 0, Quantity_TOC_RGB)   # Green
+
     # Also define string versions for DisplayShape
     ORIGINAL_COLOR_STR = "GRAY"
     TARGET_COLOR_STR = "BLUE" 
@@ -1329,8 +1329,12 @@ def create_opencascade_animation(original_column, deformed_column, frames, max_f
         # This helps us use the actual optimization data rather than just interpolation
         rotation_data = []
         
-        # Initialize display once for all frames
-        display, start_display, add_menu, add_function_to_menu = init_display(size=(1024, 768))
+        # Initialize display once for all frames with higher resolution
+        display, start_display, add_menu, add_function_to_menu = init_display(size=(1920, 1080))
+        
+        # Set higher resolution for the view window
+        display.SetSize(1920, 1080)
+        display.Repaint()
         
         # Set white background for better visibility
         # display.set_bg_gradient_color(255, 255, 255)
@@ -1394,52 +1398,66 @@ def create_opencascade_animation(original_column, deformed_column, frames, max_f
             # Clear previous shapes
             display.EraseAll()
             
-            # Display original column (white, with moderate transparency)
+            # Check if this is the final frame
+            is_final_frame = frame_idx == len(selected_frames) - 1
+            
+            # GRAY: Display original column (initial state)
             for segment in original_column.segments:
                 shape = segment.create_geometry()
-                display.DisplayShape(shape, color="WHITE", transparency=0.6, update=False)
+                # Higher transparency for the original column
+                display.DisplayShape(shape, color="GRAY", transparency=0.7, update=False)
             
-            # Display target deformed column (blue, with low transparency)
+            # BLUE: Display target deformed column (goal state)
             for segment in deformed_column.segments:
                 shape = segment.create_geometry()
-                display.DisplayShape(shape, color="BLUE", transparency=0.4, update=False)
+                # Medium transparency for the target column
+                display.DisplayShape(shape, color="BLUE", transparency=0.5, update=False)
             
-            # Display current iteration column (red, fully visible)
+            # RED/GREEN: Display current iteration column
             for segment in column.segments:
                 shape = segment.create_geometry()
-                display.DisplayShape(shape, color="RED", transparency=0.0, update=False)
+                if is_final_frame:
+                    # GREEN: Final result (no transparency for visibility)
+                    display.DisplayShape(shape, color="GREEN", transparency=0.0, update=False)
+                else:
+                    # RED: Intermediate states (no transparency for visibility)
+                    display.DisplayShape(shape, color="RED", transparency=0.0, update=False)
             
             # Set up the view with a fixed camera angle
             display.View_Iso()
             display.FitAll()
             
             # Set a good fixed view angle (no rotation)
-            display.View.SetProj(0.7, 0.7, 0.2)
+            display.View.SetProj(0.7, 0.7, 0.1)
             
             # Update display
             display.Repaint()
             
-            # Capture the frame at high resolution
+            # Capture the frame at higher resolution
             frame_file = os.path.join(temp_dir, f"frame_{frame_idx:03d}.png")
-            display.View.Dump(frame_file)
+            
+            # Set higher quality for image dump
+            display.View.SetBackgroundColor(white_color)  # Ensure white background
+            display.FitAll()  # Make sure the view is properly fitted
+            display.View.Dump(frame_file)  # The method doesn't accept width/height parameters
             frame_files.append(frame_file)
             
-            print(f"Rendered frame {frame_idx+1}/{len(selected_frames)}")
+            print(f"Rendered high-resolution frame {frame_idx+1}/{len(selected_frames)}")
         
         # Close the display when done with all frames
         display.EraseAll()
         
         # Create GIF from the frames
         output_file = "opencascade_optimization.gif"
+        output_hq_file = "opencascade_optimization_hq.gif"  # Higher quality version
         
         try:
-            print("Creating animation...")
+            print("Creating high-resolution animation...")
             # Create the GIF using PIL
             frames_pil = [Image.open(f) for f in frame_files]
             
-            # Keep original size for better quality
-            # No resizing to maintain details
-            
+            # Create two versions - one standard and one higher quality
+            # Standard version with reasonable size
             frames_pil[0].save(
                 output_file,
                 save_all=True,
@@ -1450,21 +1468,42 @@ def create_opencascade_animation(original_column, deformed_column, frames, max_f
             )
             print(f"Animation saved as '{output_file}'")
             
-            # Alternatively, use ImageMagick if available for higher quality
+            # Use ImageMagick for the highest quality possible
             try:
+                # Higher quality with better color depth and rendering
                 subprocess.run([
-                    'convert', '-delay', '20', '-loop', '0',
-                    os.path.join(temp_dir, 'frame_*.png'), output_file
+                    'convert', 
+                    '-delay', '20',
+                    '-dispose', 'Background',
+                    '-alpha', 'remove',
+                    '-resize', '1024x768',  # Resize to a reasonable size
+                    '-layers', 'optimize',   # Optimize layers
+                    os.path.join(temp_dir, 'frame_*.png'), 
+                    output_hq_file
                 ], check=True)
-                print(f"Animation created with ImageMagick and saved as '{output_file}'")
+                print(f"High-quality animation created with ImageMagick and saved as '{output_hq_file}'")
             except (subprocess.SubprocessError, FileNotFoundError):
-                # If ImageMagick fails or isn't available, we already have the PIL version
-                pass
+                # If ImageMagick fails or isn't available, make higher quality PIL version
+                try:
+                    # Optional: resize only if needed for large displays
+                    # Keeping aspect ratio but ensuring maximum quality
+                    frames_pil[0].save(
+                        output_hq_file,
+                        save_all=True,
+                        append_images=frames_pil[1:],
+                        optimize=False,
+                        quality=100,
+                        duration=200,
+                        loop=0
+                    )
+                    print(f"High-quality version saved as '{output_hq_file}'")
+                except Exception as inner_e:
+                    print(f"Could not create high-quality version: {inner_e}")
                 
         except Exception as e:
             print(f"Error creating GIF: {e}")
     
-    return output_file
+    return {"standard": output_file, "high_quality": output_hq_file}
 
 # ================== CONFIGURATION MANAGEMENT ===================
 class ConfigManager:
@@ -1737,8 +1776,8 @@ def run_incremental_optimization_experiment(config=None, config_file=None):
 
     # Create OpenCascade animation from optimization frames
     # Use a subset of frames to limit to 20 frames maximum
-    opencascade_gif = create_opencascade_animation(original_column, deformed_column, frames, max_frames=20)
-    print(f"OpenCascade animation saved as: {opencascade_gif}")
+    animation_files = create_opencascade_animation(original_column, deformed_column, frames, max_frames=20)
+    print(f"OpenCascade animations saved: Standard = {animation_files['standard']}, High-Quality = {animation_files['high_quality']}")
 
     # Final visualization with OpenCascade
     display, start_display, _, _ = init_display()
