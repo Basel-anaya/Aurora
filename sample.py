@@ -1278,9 +1278,156 @@ def visualize_optimization_results(original_column, deformed_column, result_colu
     
     return fig, anim
 
+def plot_iteration_node_errors(intermediate_columns, deformed_column, output_file="node_distance_iterations.png"):
+    """
+    Creates a plot showing the distance between ICPIK result and ground truth nodes for each iteration.
+    
+    Args:
+        intermediate_columns: List of columns representing each iteration of optimization
+        deformed_column: The target/ground truth deformed column
+        output_file: Filename to save the plot
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    # Create figure
+    plt.figure(figsize=(12, 8))
+    
+    # Get the number of segments/nodes
+    num_segments = len(deformed_column.segments)
+    node_indices = list(range(num_segments))
+    
+    # Calculate distance between result and ground truth for each node and each iteration
+    iteration_errors = []
+    
+    for iteration, result_column in enumerate(intermediate_columns):
+        errors = []
+        for i in range(num_segments):
+            # Calculate the Euclidean distance between result and ground truth positions
+            gt_pos = deformed_column.segments[i].end_pos
+            result_pos = result_column.segments[i].end_pos
+            distance = np.linalg.norm(result_pos - gt_pos)
+            errors.append(distance)
+        
+        iteration_errors.append(errors)
+    
+    # Plot distance for each node across iterations
+    iterations = list(range(len(intermediate_columns)))
+    
+    # Plot node distances over iterations
+    for node_idx in node_indices:
+        node_errors = [iteration_errors[it][node_idx] for it in range(len(iterations))]
+        plt.plot(iterations, node_errors, '-', linewidth=2, label=f'Node {node_idx}')
+    
+    # Configure plot
+    plt.title('Distance Between ICPIK Result and Ground Truth During Optimization', fontsize=16)
+    plt.xlabel('Iteration', fontsize=14)
+    plt.ylabel('Euclidean Distance (meters)', fontsize=14)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # Create custom legend with color-coded nodes
+    plt.legend(loc='upper right', fontsize=10)
+    
+    # Add annotations for key iterations
+    plt.annotate('Initial State', xy=(0, iteration_errors[0][0]), 
+                 xytext=(0, max([max(errors) for errors in iteration_errors]) * 1.1),
+                 arrowprops=dict(facecolor='black', shrink=0.05, width=1.5, headwidth=8),
+                 fontsize=12, ha='center')
+    
+    plt.annotate('Final State', xy=(len(iterations)-1, iteration_errors[-1][0]), 
+                 xytext=(len(iterations)-1, max([max(errors) for errors in iteration_errors]) * 1.1),
+                 arrowprops=dict(facecolor='black', shrink=0.05, width=1.5, headwidth=8),
+                 fontsize=12, ha='center')
+    
+    # Improve visual style
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    
+    return output_file
+
+def create_combined_visualization_frame(column_image_path, iteration_errors, current_iteration, intermediate_columns, deformed_column, temp_dir):
+    """
+    Creates a combined visualization frame showing both the 3D column and the error plot side by side.
+    
+    Args:
+        column_image_path: Path to the 3D column visualization image
+        iteration_errors: List of lists containing errors for each node at each iteration
+        current_iteration: The current iteration index
+        intermediate_columns: List of columns representing each iteration
+        deformed_column: The target/ground truth deformed column
+        temp_dir: Temporary directory to save the combined image
+        
+    Returns:
+        Path to the combined image
+    """
+    import matplotlib.pyplot as plt
+    from PIL import Image
+    import numpy as np
+    import os
+    
+    # Create a figure with two horizontal panels
+    fig = plt.figure(figsize=(20, 8))
+    
+    # Left panel for 3D visualization (5/10 of width)
+    ax1 = plt.subplot2grid((1, 10), (0, 0), colspan=5)
+    
+    # Right panel for error plot (5/10 of width)
+    ax2 = plt.subplot2grid((1, 10), (0, 5), colspan=5)
+    
+    # Load and display the column image in the left panel
+    column_img = Image.open(column_image_path)
+    ax1.imshow(np.array(column_img))
+    ax1.axis('off')  # Hide axes
+    ax1.set_title("Column Optimization", fontsize=16)
+    
+    # Create error plot in the right panel
+    iterations = list(range(len(intermediate_columns)))
+    
+    # Get the number of segments/nodes
+    num_segments = len(deformed_column.segments)
+    node_indices = list(range(num_segments))
+    
+    # Plot node distances over iterations
+    for node_idx in node_indices:
+        node_errors = [iteration_errors[it][node_idx] for it in range(len(iterations))]
+        line, = ax2.plot(iterations, node_errors, '-', linewidth=2, label=f'Node {node_idx}')
+        
+        # Highlight current iteration with a marker
+        if current_iteration <= len(iterations)-1:
+            current_error = node_errors[current_iteration]
+            ax2.plot(current_iteration, current_error, 'o', color=line.get_color(), markersize=8)
+    
+    # Configure error plot
+    ax2.set_title('Distance Between ICPIK Result and Ground Truth', fontsize=16)
+    ax2.set_xlabel('Iteration', fontsize=14)
+    ax2.set_ylabel('Euclidean Distance (meters)', fontsize=14)
+    ax2.grid(True, linestyle='--', alpha=0.7)
+    ax2.legend(loc='upper right', fontsize=10)
+    
+    # Add vertical line for current iteration
+    if current_iteration <= len(iterations)-1:
+        ax2.axvline(x=current_iteration, color='black', linestyle='--', alpha=0.5)
+        ax2.text(current_iteration + 0.1, ax2.get_ylim()[1] * 0.95, 
+                f'Iteration {current_iteration}', fontsize=12, va='top')
+    
+    # Set y-axis limits to be consistent across frames
+    max_error = max([max(errors) for errors in iteration_errors]) * 1.1
+    ax2.set_ylim(0, max_error)
+    
+    # Adjust layout
+    plt.tight_layout()
+    
+    # Save the combined figure
+    combined_path = os.path.join(temp_dir, f"combined_{current_iteration:03d}.png")
+    plt.savefig(combined_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    
+    return combined_path
+
 def create_opencascade_animation(original_column, deformed_column, frames, max_frames=20):
     """
     Creates and saves a GIF animation of the optimization process using OpenCascade TK visualization
+    combined with a plot showing node distance errors over iterations.
     
     Args:
         original_column: The original (straight) column
@@ -1300,13 +1447,13 @@ def create_opencascade_animation(original_column, deformed_column, frames, max_f
     from OCC.Core.gp import gp_Pnt, gp_Ax1, gp_Vec, gp_Dir
     from OCC.Core.Quantity import Quantity_Color, Quantity_TOC_RGB
     
-    print("Creating enhanced OpenCascade animation...")
+    print("Creating enhanced OpenCascade animation with error plot...")
     
     # Color definitions using Quantity_Color for better visual quality
     ORIGINAL_COLOR = Quantity_Color(0.9, 0.9, 0.9, Quantity_TOC_RGB)  # Light Gray
     TARGET_COLOR = Quantity_Color(0.3, 0.5, 0.9, Quantity_TOC_RGB)    # Blue 
-    CURRENT_COLOR = Quantity_Color( 0, 1, 0, Quantity_TOC_RGB)   # Green
-
+    CURRENT_COLOR = Quantity_Color(1.0, 0.4, 0.4, Quantity_TOC_RGB)   # Red
+    
     # Also define string versions for DisplayShape
     ORIGINAL_COLOR_STR = "GRAY"
     TARGET_COLOR_STR = "BLUE" 
@@ -1324,20 +1471,20 @@ def create_opencascade_animation(original_column, deformed_column, frames, max_f
     # Create temporary directory for frame images
     with tempfile.TemporaryDirectory() as temp_dir:
         frame_files = []
+        combined_frame_files = []
         
         # Extract rotation data from the original frames for more accurate animation
         # This helps us use the actual optimization data rather than just interpolation
         rotation_data = []
         
         # Initialize display once for all frames with higher resolution
-        display, start_display, add_menu, add_function_to_menu = init_display(size=(1920, 1080))
+        display, start_display, add_menu, add_function_to_menu = init_display(size=(1024, 768))
         
         # Set higher resolution for the view window
-        display.SetSize(1920, 1080)
+        display.SetSize(1024, 768)
         display.Repaint()
         
         # Set white background for better visibility
-        # display.set_bg_gradient_color(255, 255, 255)
         white_color = Quantity_Color(1, 1, 1, Quantity_TOC_RGB)
         display.View.SetBackgroundColor(white_color)
         
@@ -1393,6 +1540,24 @@ def create_opencascade_animation(original_column, deformed_column, frames, max_f
             
             intermediate_columns.append(frame_column)
         
+        # Precompute all error data for each iteration
+        iteration_errors = []
+        
+        for iteration, result_column in enumerate(intermediate_columns):
+            errors = []
+            for i in range(len(deformed_column.segments)):
+                # Calculate the Euclidean distance between result and ground truth positions
+                gt_pos = deformed_column.segments[i].end_pos
+                result_pos = result_column.segments[i].end_pos
+                distance = np.linalg.norm(result_pos - gt_pos)
+                errors.append(distance)
+            
+            iteration_errors.append(errors)
+        
+        # Generate the static node distance plot for reference
+        plot_file = plot_iteration_node_errors(intermediate_columns, deformed_column)
+        print(f"Reference node distance plot saved as: {plot_file}")
+        
         # Now render each frame with advanced visualization
         for frame_idx, (frame, column) in enumerate(zip(selected_frames, intermediate_columns)):
             # Clear previous shapes
@@ -1401,34 +1566,30 @@ def create_opencascade_animation(original_column, deformed_column, frames, max_f
             # Check if this is the final frame
             is_final_frame = frame_idx == len(selected_frames) - 1
             
-            # GRAY: Display original column (initial state)
+            # WHITE: Display original column (initial state/straight)
             for segment in original_column.segments:
                 shape = segment.create_geometry()
                 # Higher transparency for the original column
-                display.DisplayShape(shape, color="GRAY", transparency=0.7, update=False)
+                display.DisplayShape(shape, color="WHITE", transparency=0.3, update=False)
             
-            # BLUE: Display target deformed column (goal state)
+            # BLUE: Display target deformed column
             for segment in deformed_column.segments:
                 shape = segment.create_geometry()
                 # Medium transparency for the target column
-                display.DisplayShape(shape, color="BLUE", transparency=0.5, update=False)
+                display.DisplayShape(shape, color="BLUE", transparency=0.3, update=False)
             
-            # RED/GREEN: Display current iteration column
+            # GREEN: Display current iteration column (moving/optimizing)
             for segment in column.segments:
                 shape = segment.create_geometry()
-                if is_final_frame:
-                    # GREEN: Final result (no transparency for visibility)
-                    display.DisplayShape(shape, color="GREEN", transparency=0.0, update=False)
-                else:
-                    # RED: Intermediate states (no transparency for visibility)
-                    display.DisplayShape(shape, color="RED", transparency=0.0, update=False)
+                # No transparency for the moving column to make it more visible
+                display.DisplayShape(shape, color="GREEN", transparency=0.0, update=False)
             
             # Set up the view with a fixed camera angle
             display.View_Iso()
             display.FitAll()
             
             # Set a good fixed view angle (no rotation)
-            display.View.SetProj(0.7, 0.7, 0.1)
+            display.View.SetProj(0.7, 0.7, 0.2)
             
             # Update display
             display.Repaint()
@@ -1439,71 +1600,78 @@ def create_opencascade_animation(original_column, deformed_column, frames, max_f
             # Set higher quality for image dump
             display.View.SetBackgroundColor(white_color)  # Ensure white background
             display.FitAll()  # Make sure the view is properly fitted
-            display.View.Dump(frame_file)  # The method doesn't accept width/height parameters
+            display.View.Dump(frame_file)  # Capture the OpenCascade view
             frame_files.append(frame_file)
             
-            print(f"Rendered high-resolution frame {frame_idx+1}/{len(selected_frames)}")
+            # Create combined frame with 3D visualization and error plot
+            combined_frame = create_combined_visualization_frame(
+                frame_file, 
+                iteration_errors, 
+                frame_idx,
+                intermediate_columns,
+                deformed_column,
+                temp_dir
+            )
+            combined_frame_files.append(combined_frame)
+            
+            print(f"Rendered combined frame {frame_idx+1}/{len(selected_frames)}")
         
         # Close the display when done with all frames
         display.EraseAll()
         
         # Create GIF from the frames
         output_file = "opencascade_optimization.gif"
-        output_hq_file = "opencascade_optimization_hq.gif"  # Higher quality version
+        output_combined_file = "combined_optimization.gif"
         
         try:
-            print("Creating high-resolution animation...")
-            # Create the GIF using PIL
+            print("Creating standard animation...")
+            # Create the GIF using PIL for standard frames
             frames_pil = [Image.open(f) for f in frame_files]
-            
-            # Create two versions - one standard and one higher quality
-            # Standard version with reasonable size
             frames_pil[0].save(
                 output_file,
                 save_all=True,
                 append_images=frames_pil[1:],
-                optimize=False,  # No optimization to maintain quality
-                duration=200,    # Slightly faster for good visualization
-                loop=0           # Loop forever
+                optimize=False,
+                duration=200,
+                loop=0
             )
-            print(f"Animation saved as '{output_file}'")
+            print(f"Standard animation saved as '{output_file}'")
             
-            # Use ImageMagick for the highest quality possible
+            print("Creating combined animation with error plot...")
+            # Create the GIF using PIL for combined frames
+            combined_frames_pil = [Image.open(f) for f in combined_frame_files]
+            combined_frames_pil[0].save(
+                output_combined_file,
+                save_all=True,
+                append_images=combined_frames_pil[1:],
+                optimize=False,
+                duration=200,
+                loop=0
+            )
+            print(f"Combined animation saved as '{output_combined_file}'")
+            
+            # Use ImageMagick for higher quality if available
             try:
-                # Higher quality with better color depth and rendering
                 subprocess.run([
                     'convert', 
                     '-delay', '20',
                     '-dispose', 'Background',
-                    '-alpha', 'remove',
-                    '-resize', '1024x768',  # Resize to a reasonable size
-                    '-layers', 'optimize',   # Optimize layers
-                    os.path.join(temp_dir, 'frame_*.png'), 
-                    output_hq_file
+                    '-resize', '1280x720',  # Reasonable size for the combined version
+                    os.path.join(temp_dir, 'combined_*.png'), 
+                    'combined_optimization_hq.gif'
                 ], check=True)
-                print(f"High-quality animation created with ImageMagick and saved as '{output_hq_file}'")
+                print("High-quality combined animation created with ImageMagick")
             except (subprocess.SubprocessError, FileNotFoundError):
-                # If ImageMagick fails or isn't available, make higher quality PIL version
-                try:
-                    # Optional: resize only if needed for large displays
-                    # Keeping aspect ratio but ensuring maximum quality
-                    frames_pil[0].save(
-                        output_hq_file,
-                        save_all=True,
-                        append_images=frames_pil[1:],
-                        optimize=False,
-                        quality=100,
-                        duration=200,
-                        loop=0
-                    )
-                    print(f"High-quality version saved as '{output_hq_file}'")
-                except Exception as inner_e:
-                    print(f"Could not create high-quality version: {inner_e}")
+                pass
                 
         except Exception as e:
             print(f"Error creating GIF: {e}")
     
-    return {"standard": output_file, "high_quality": output_hq_file}
+    return {
+        "standard": output_file, 
+        "combined": output_combined_file,
+        "plot": plot_file
+    }
 
 # ================== CONFIGURATION MANAGEMENT ===================
 class ConfigManager:
@@ -1777,7 +1945,11 @@ def run_incremental_optimization_experiment(config=None, config_file=None):
     # Create OpenCascade animation from optimization frames
     # Use a subset of frames to limit to 20 frames maximum
     animation_files = create_opencascade_animation(original_column, deformed_column, frames, max_frames=20)
-    print(f"OpenCascade animations saved: Standard = {animation_files['standard']}, High-Quality = {animation_files['high_quality']}")
+    print(f"OpenCascade animations saved:")
+    print(f"  - Standard: {animation_files['standard']}")
+    print(f"  - Combined with error plot: {animation_files['combined']}")
+    print(f"  - Static error plot: {animation_files['plot']}")
+    print(f"The combined animation shows both the 3D column deformation and the node distance error plot side by side.")
 
     # Final visualization with OpenCascade
     display, start_display, _, _ = init_display()
@@ -1785,7 +1957,7 @@ def run_incremental_optimization_experiment(config=None, config_file=None):
     # Original column (white)
     for segment in original_column.segments:
         shape = segment.create_geometry()
-        display.DisplayShape(shape, color="WHITE", update=False)
+        display.DisplayShape(shape, color="GRAY", update=False)
     
     # Deformed column (blue)
     for segment in deformed_column.segments:
